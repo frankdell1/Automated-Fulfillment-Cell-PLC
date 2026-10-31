@@ -5,7 +5,7 @@
 **Release:** Portfolio Version 1.1  
 **Status:** Commissioned and accepted for portfolio demonstration
 
-![Completed Factory I/O fulfillment cell](Evidence/Factory_IO_Final_Scenes.png)
+![Completed Factory I/O fulfillment cell](Evidence/Factory_IO_Final_Scene.png)
 
 ## Project Summary
 
