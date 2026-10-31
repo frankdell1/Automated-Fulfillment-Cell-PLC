@@ -1,0 +1,961 @@
+// ==========================================================
+// FB_SORTATIONCONTROLLER
+// Complete sorter implementation
+// Required Static interface variable:
+//     TotalCompleted : DInt   (start value 0)
+// ==========================================================
+
+
+// ----------------------------------------------------------
+// 1. EDGE DETECTION
+// ----------------------------------------------------------
+
+#StateAtScanStart := #CurrentState;
+
+#NewProductAdded :=
+#ProductAdded AND NOT #PreviousProductAdded;
+
+#AEnterRise :=
+#AEnter AND NOT #PreviousAEnter;
+
+#AExitRise :=
+#AExit AND NOT #PreviousAExit;
+
+#BEnterRise :=
+#BEnter AND NOT #PreviousBEnter;
+
+#BExitRise :=
+#BExit AND NOT #PreviousBExit;
+
+#RFIDARise :=
+#RFIDAPresent AND NOT #PreviousRFIDAPresent;
+
+#RFIDBRise :=
+#RFIDBPresent AND NOT #PreviousRFIDBPresent;
+
+#RejectRise :=
+#RejectPresent AND NOT #PreviousRejectPresent;
+
+
+// Save input states for the next PLC scan
+#PreviousProductAdded := #ProductAdded;
+
+#PreviousAEnter := #AEnter;
+#PreviousAExit := #AExit;
+
+#PreviousBEnter := #BEnter;
+#PreviousBExit := #BExit;
+
+#PreviousRFIDAPresent := #RFIDAPresent;
+#PreviousRFIDBPresent := #RFIDBPresent;
+#PreviousRejectPresent := #RejectPresent;
+
+
+// ----------------------------------------------------------
+// 2. SAFE DEFAULT OUTPUTS
+// ----------------------------------------------------------
+
+#MainConveyorCmd := FALSE;
+
+#PusherACmd := FALSE;
+#PusherBCmd := FALSE;
+
+#BranchAConveyorCmd := FALSE;
+#BranchBConveyorCmd := FALSE;
+#RejectConveyorCmd := FALSE;
+
+#ARemoverCmd := FALSE;
+#BRemoverCmd := FALSE;
+#RejectRemoverCmd := FALSE;
+
+#CanAcceptProduct := FALSE;
+#Busy := FALSE;
+
+// One-scan completion pulse
+#RouteComplete := FALSE;
+
+// Timer enables are selected by the active state
+#RouteTimerEnable := FALSE;
+#PusherTimerEnable := FALSE;
+#OutfeedTimerEnable := FALSE;
+
+
+// ----------------------------------------------------------
+// 3. RESET
+// ----------------------------------------------------------
+
+IF #Reset THEN
+    
+    // Empty all FIFO queue positions
+    FOR #i := 1 TO 20 DO
+        #ProductQueue[#i] := 0;
+    END_FOR;
+    
+    #QueueHead := 1;
+    #QueueTail := 1;
+    #InternalQueueCount := 0;
+    
+    #CurrentState := 0;
+    #CurrentIndex := 0;
+    #CurrentDestination := 0;
+    
+    #FaultLatched := FALSE;
+    #InternalFaultCode := 0;
+    
+    #RoutedIndex := 0;
+    #RoutedDestination := 0;
+
+    // Reset the completed-product test counter
+    #TotalCompleted := 0;
+    
+ELSE
+    
+    // ------------------------------------------------------
+    // 4. ADD IDENTIFIED PRODUCTS TO THE FIFO QUEUE
+    // ------------------------------------------------------
+    
+    IF #NewProductAdded THEN
+        
+        IF (#AddedIndex < 1) OR (#AddedIndex > 20) THEN
+            
+            // Fault 101:
+            // ProductManager provided an invalid array index
+            #FaultLatched := TRUE;
+            #InternalFaultCode := 101;
+            
+        ELSIF NOT
+            "DB_ProductTracking".Products[#AddedIndex].Valid
+        THEN
+            
+            // Fault 102:
+            // ProductManager says Added, but record is not valid
+            #FaultLatched := TRUE;
+            #InternalFaultCode := 102;
+            
+        ELSIF #InternalQueueCount >= 20 THEN
+            
+            // Fault 100: sortation queue is full
+            #FaultLatched := TRUE;
+            #InternalFaultCode := 100;
+            
+        ELSE
+            
+            // Add the tracking-array index at QueueTail
+            #ProductQueue[#QueueTail] := #AddedIndex;
+            
+            #QueueTail := #QueueTail + 1;
+            
+            // Circular queue wraparound
+            IF #QueueTail > 20 THEN
+                #QueueTail := 1;
+            END_IF;
+            
+            #InternalQueueCount :=
+            #InternalQueueCount + 1;
+            
+        END_IF;
+        
+    END_IF;
+    
+    
+    // ------------------------------------------------------
+    // 5. SORTATION STATE MACHINE
+    // ------------------------------------------------------
+    
+    IF #FaultLatched THEN
+        
+        #CurrentState := 900;
+        
+    ELSIF #Enable AND #AutoRequest THEN
+        
+        CASE #CurrentState OF
+                
+                // ==================================================
+                // STATE 0 — INITIALIZE
+                // ==================================================
+                
+            0:
+                #CurrentIndex := 0;
+                #CurrentDestination := 0;
+                
+                #CurrentState := 10;
+                
+                
+                // ==================================================
+                // STATE 10 — WAIT FOR PRODUCT AT PUSHER A
+                // ==================================================
+                
+            10:
+                #Busy := (#InternalQueueCount > 0);
+                
+                // Single-product backpressure for the upstream emitter.
+                // Do not release another box while one is queued or being routed.
+                #CanAcceptProduct :=
+                (#InternalQueueCount = 0) AND
+                NOT #AEnter;
+                
+                // Run the sorter conveyor only when a queued product exists.
+                #MainConveyorCmd :=
+                (#InternalQueueCount > 0) AND
+                NOT #AEnter;
+                
+                IF (#InternalQueueCount > 0) AND
+                    (#AEnterRise OR #AEnter) THEN
+                    
+                    // Remove the oldest product from the queue
+                    #CurrentIndex :=
+                    #ProductQueue[#QueueHead];
+                    
+                    #ProductQueue[#QueueHead] := 0;
+                    
+                    #QueueHead := #QueueHead + 1;
+                    
+                    IF #QueueHead > 20 THEN
+                        #QueueHead := 1;
+                    END_IF;
+                    
+                    #InternalQueueCount :=
+                    #InternalQueueCount - 1;
+                    
+                    
+                    // Validate the queue entry
+                    IF (#CurrentIndex < 1) OR
+                        (#CurrentIndex > 20) THEN
+                        
+                        // Invalid index stored in the queue
+                        #FaultLatched := TRUE;
+                        #InternalFaultCode := 103;
+                        #CurrentState := 900;
+                        
+                    ELSIF NOT
+                        "DB_ProductTracking".Products[
+                        #CurrentIndex].Valid
+                    THEN
+                        
+                        // Queue references an unused record
+                        #FaultLatched := TRUE;
+                        #InternalFaultCode := 104;
+                        #CurrentState := 900;
+                        
+                    ELSE
+                        
+                        // Read the destination remembered at RFID 0
+                        #CurrentDestination :=
+                        "DB_ProductTracking".Products[
+                        #CurrentIndex].Destination;
+                        
+                        // Product has entered the sortation zone
+                        "DB_ProductTracking".Products[
+                        #CurrentIndex].CurrentZone := 4;
+                        
+                        // Status 2 = sorting in progress
+                        "DB_ProductTracking".Products[
+                        #CurrentIndex].Status := 2;
+                        
+                        #TimeResult :=
+                        RD_LOC_T(OUT => #CurrentTime);
+                        
+                        IF (#TimeResult = 0) OR
+                            (#TimeResult = 1) THEN
+                            
+                            "DB_ProductTracking".Products[
+                            #CurrentIndex].LastMoveTimestamp :=
+                            #CurrentTime;
+                            
+                        END_IF;
+                        
+                        
+                        // Select the physical route
+                        CASE #CurrentDestination OF
+                                
+                            1:
+                                // Destination 1 uses Pusher A
+                                #CurrentState := 20;
+                                
+                            2:
+                                // Destination 2 passes A
+                                // and uses Pusher B
+                                #CurrentState := 40;
+                                
+                            3:
+                                // Destination 3 passes both
+                                // pushers and enters reject
+                                #CurrentState := 40;
+                                
+                            ELSE
+                                
+                                "DB_ProductTracking".Products[
+                                #CurrentIndex].TrackingFault :=
+                                TRUE;
+                                
+                                "DB_ProductTracking".Products[
+                                #CurrentIndex].RejectReason := 2;
+                                
+                                // Fault 105:
+                                // Invalid stored destination
+                                #FaultLatched := TRUE;
+                                #InternalFaultCode := 105;
+                                #CurrentState := 900;
+                                
+                        END_CASE;
+                        
+                    END_IF;
+                    
+                END_IF;
+                
+                
+                // ==================================================
+                // DESTINATION 1 — PUSHER A
+                // ==================================================
+                
+                // STATE 20 — WAIT FOR BRANCH A TO BE AVAILABLE
+            20:
+                #Busy := TRUE;
+                #RouteTimerEnable := TRUE;
+                
+                IF NOT #RFIDAPresent AND
+                    NOT #OutfeedAPresent AND
+                    #PusherABack AND
+                    NOT #PusherAFront THEN
+                    
+                    #CurrentState := 21;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Branch A occupied or pusher not ready
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 201;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 21 — EXTEND PUSHER A
+            21:
+                #Busy := TRUE;
+                
+                #PusherACmd := TRUE;
+                #BranchAConveyorCmd := TRUE;
+                
+                #PusherTimerEnable := TRUE;
+                
+                IF #PusherAFront THEN
+                    
+                    #CurrentState := 22;
+                    
+                ELSIF #PusherTimer.Q THEN
+                    
+                    // Pusher A failed to reach front limit
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 202;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 22 — RETRACT PUSHER A
+            22:
+                #Busy := TRUE;
+                
+                #PusherACmd := FALSE;
+                #BranchAConveyorCmd := TRUE;
+                
+                #PusherTimerEnable := TRUE;
+                
+                IF #PusherABack THEN
+                    
+                    #CurrentState := 23;
+                    
+                ELSIF #PusherTimer.Q THEN
+                    
+                    // Pusher A failed to return
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 203;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 23 — MOVE PRODUCT TO RFID A
+            23:
+                #Busy := TRUE;
+                #BranchAConveyorCmd := TRUE;
+                
+                #RouteTimerEnable := TRUE;
+                
+                IF #RFIDARise OR #RFIDAPresent THEN
+                    
+                    #CurrentState := 24;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Product failed to reach RFID A
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 204;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 24 — MOVE PRODUCT FROM RFID A TO OUTFEED A
+            24:
+                #Busy := TRUE;
+                #BranchAConveyorCmd := TRUE;
+                
+                #OutfeedTimerEnable := TRUE;
+                
+                IF #OutfeedAPresent THEN
+                    
+                    #CurrentState := 25;
+                    
+                ELSIF #OutfeedTimer.Q THEN
+                    
+                    // Product failed to reach Outfeed A
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 205;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 25 — REMOVE PRODUCT FROM OUTFEED A
+            25:
+                #Busy := TRUE;
+                
+                #BranchAConveyorCmd := TRUE;
+                #ARemoverCmd := TRUE;
+                
+                #OutfeedTimerEnable := TRUE;
+                
+                IF NOT #OutfeedAPresent THEN
+                    
+                    #CurrentState := 80;
+                    
+                ELSIF #OutfeedTimer.Q THEN
+                    
+                    // Product remained at Outfeed A
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 206;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // ==================================================
+                // PASS PUSHER A
+                // ==================================================
+                
+                // STATE 40 — WAIT FOR PRODUCT TO EXIT PUSHER A
+            40:
+                #Busy := TRUE;
+                
+                // Do not move if Pusher A is extended
+                #MainConveyorCmd :=
+                #PusherABack AND
+                NOT #PusherAFront;
+                
+                #RouteTimerEnable := TRUE;
+                
+                IF #AExitRise OR #AExit THEN
+                    
+                    #CurrentState := 41;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Product failed to pass Pusher A
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 301;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 41 — MOVE PRODUCT TO PUSHER B
+            41:
+                #Busy := TRUE;
+                
+                // Do not approach Pusher B if it is extended
+                #MainConveyorCmd :=
+                #PusherBBack AND
+                NOT #PusherBFront;
+                
+                #RouteTimerEnable := TRUE;
+                
+                IF #BEnterRise OR #BEnter THEN
+                    
+                    // Stop at Pusher B
+                    #MainConveyorCmd := FALSE;
+                    
+                    IF #CurrentDestination = 2 THEN
+                        
+                        #CurrentState := 50;
+                        
+                    ELSIF #CurrentDestination = 3 THEN
+                        
+                        #CurrentState := 60;
+                        
+                    ELSE
+                        
+                        #FaultLatched := TRUE;
+                        #InternalFaultCode := 302;
+                        #CurrentState := 900;
+                        
+                    END_IF;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Product failed to reach Pusher B
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 303;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // ==================================================
+                // DESTINATION 2 — PUSHER B
+                // ==================================================
+                
+                // STATE 50 — WAIT FOR BRANCH B TO BE AVAILABLE
+            50:
+                #Busy := TRUE;
+                #RouteTimerEnable := TRUE;
+                
+                IF NOT #RFIDBPresent AND
+                    NOT #OutfeedBPresent AND
+                    #PusherBBack AND
+                    NOT #PusherBFront THEN
+                    
+                    #CurrentState := 51;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Branch B occupied or pusher not ready
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 401;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 51 — EXTEND PUSHER B
+            51:
+                #Busy := TRUE;
+                
+                #PusherBCmd := TRUE;
+                #BranchBConveyorCmd := TRUE;
+                
+                #PusherTimerEnable := TRUE;
+                
+                IF #PusherBFront THEN
+                    
+                    #CurrentState := 52;
+                    
+                ELSIF #PusherTimer.Q THEN
+                    
+                    // Pusher B failed to reach front limit
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 402;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 52 — RETRACT PUSHER B
+            52:
+                #Busy := TRUE;
+                
+                #PusherBCmd := FALSE;
+                #BranchBConveyorCmd := TRUE;
+                
+                #PusherTimerEnable := TRUE;
+                
+                IF #PusherBBack THEN
+                    
+                    #CurrentState := 53;
+                    
+                ELSIF #PusherTimer.Q THEN
+                    
+                    // Pusher B failed to return
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 403;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 53 — MOVE PRODUCT TO RFID B
+            53:
+                #Busy := TRUE;
+                #BranchBConveyorCmd := TRUE;
+                
+                #RouteTimerEnable := TRUE;
+                
+                IF #RFIDBRise OR #RFIDBPresent THEN
+                    
+                    #CurrentState := 54;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Product failed to reach RFID B
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 404;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 54 — MOVE PRODUCT FROM RFID B TO OUTFEED B
+            54:
+                #Busy := TRUE;
+                #BranchBConveyorCmd := TRUE;
+                
+                #OutfeedTimerEnable := TRUE;
+                
+                IF #OutfeedBPresent THEN
+                    
+                    #CurrentState := 55;
+                    
+                ELSIF #OutfeedTimer.Q THEN
+                    
+                    // Product failed to reach Outfeed B
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 405;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 55 — REMOVE PRODUCT FROM OUTFEED B
+            55:
+                #Busy := TRUE;
+                
+                #BranchBConveyorCmd := TRUE;
+                #BRemoverCmd := TRUE;
+                
+                #OutfeedTimerEnable := TRUE;
+                
+                IF NOT #OutfeedBPresent THEN
+                    
+                    #CurrentState := 80;
+                    
+                ELSIF #OutfeedTimer.Q THEN
+                    
+                    // Product remained at Outfeed B
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 406;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // ==================================================
+                // DESTINATION 3 — REJECT ROUTE
+                // ==================================================
+                
+                // STATE 60 — PASS PUSHER B
+            60:
+                #Busy := TRUE;
+                
+                // Pusher B must be safely retracted
+                #MainConveyorCmd :=
+                #PusherBBack AND
+                NOT #PusherBFront;
+                
+                // Start the reject conveyor in advance
+                #RejectConveyorCmd := TRUE;
+                
+                #RouteTimerEnable := TRUE;
+                
+                IF #BExitRise OR #BExit THEN
+                    
+                    #CurrentState := 70;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Product failed to pass Pusher B
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 501;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 70 — MOVE PRODUCT TO REJECT SENSOR
+            70:
+                #Busy := TRUE;
+                
+                #MainConveyorCmd := TRUE;
+                #RejectConveyorCmd := TRUE;
+                
+                #RouteTimerEnable := TRUE;
+                
+                IF #RejectRise OR #RejectPresent THEN
+                    
+                    #CurrentState := 71;
+                    
+                ELSIF #RouteTimer.Q THEN
+                    
+                    // Product failed to reach reject sensor
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 502;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // STATE 71 — REMOVE PRODUCT FROM REJECT OUTFEED
+            71:
+                #Busy := TRUE;
+                
+                #MainConveyorCmd := TRUE;
+                #RejectConveyorCmd := TRUE;
+                #RejectRemoverCmd := TRUE;
+                
+                #OutfeedTimerEnable := TRUE;
+                
+                IF NOT #RejectPresent THEN
+                    
+                    #CurrentState := 80;
+                    
+                ELSIF #OutfeedTimer.Q THEN
+                    
+                    // Product remained at the reject remover
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 503;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                // ==================================================
+                // STATE 80 — ROUTE COMPLETE
+                // ==================================================
+                
+            80:
+                #Busy := TRUE;
+                #RouteComplete := TRUE;
+                
+                #RoutedIndex := #CurrentIndex;
+                #RoutedDestination := #CurrentDestination;
+                
+                
+                IF (#CurrentIndex >= 1) AND
+                    (#CurrentIndex <= 20) THEN
+                    
+                    IF "DB_ProductTracking".Products[
+                        #CurrentIndex].Valid THEN
+                        
+                        // Product has reached an outfeed route
+                        "DB_ProductTracking".Products[
+                        #CurrentIndex].CurrentZone := 5;
+                        
+                        IF #CurrentDestination = 3 THEN
+                            
+                            // Status 4 = rejected
+                            "DB_ProductTracking".Products[
+                            #CurrentIndex].Status := 4;
+                            
+                            IF "DB_ProductTracking".Products[
+                                #CurrentIndex].RejectReason = 0 THEN
+                                
+                                // Reason 3 = assigned reject route
+                                "DB_ProductTracking".Products[
+                                #CurrentIndex].RejectReason := 3;
+                                
+                            END_IF;
+                            
+                        ELSE
+                            
+                            // Status 3 = successfully routed
+                            "DB_ProductTracking".Products[
+                            #CurrentIndex].Status := 3;
+                            
+                        END_IF;
+                        
+                        
+                        #TimeResult :=
+                        RD_LOC_T(OUT => #CurrentTime);
+                        
+                        IF (#TimeResult = 0) OR
+                            (#TimeResult = 1) THEN
+                            
+                            "DB_ProductTracking".Products[
+                            #CurrentIndex].LastMoveTimestamp :=
+                            #CurrentTime;
+                            
+                        END_IF;
+                        
+                    ELSE
+                        
+                        // Active record unexpectedly became invalid
+                        #FaultLatched := TRUE;
+                        #InternalFaultCode := 601;
+                        #CurrentState := 900;
+                        
+                    END_IF;
+                    
+                ELSE
+                    
+                    // Active tracking index became invalid
+                    #FaultLatched := TRUE;
+                    #InternalFaultCode := 602;
+                    #CurrentState := 900;
+                    
+                END_IF;
+                
+                
+                IF NOT #FaultLatched THEN
+
+                    // Count each successfully completed route exactly once.
+                    // TotalCompleted is a Static DInt in this FB.
+                    #TotalCompleted := #TotalCompleted + 1;
+                    
+                    // Preserve RouteComplete for this full scan.
+                    // Release the completed tracking record next scan.
+                    #CurrentState := 81;
+                    
+                END_IF;
+                
+                
+                // ==================================================
+                // STATE 81 — RELEASE COMPLETED TRACKING RECORD
+                // ==================================================
+                
+            81:
+                #Busy := TRUE;
+                
+                IF (#CurrentIndex >= 1) AND
+                    (#CurrentIndex <= 20) THEN
+                    
+                    // The physical product has left the system.
+                    // Make its tracking-array position reusable.
+                    "DB_ProductTracking".Products[
+                    #CurrentIndex].Valid := FALSE;
+                    
+                END_IF;
+                
+                // Clear the active-product registers
+                #CurrentIndex := 0;
+                #CurrentDestination := 0;
+                
+                // Return to waiting for the next product
+                #CurrentState := 10;
+                
+                
+                // ==================================================
+                // STATE 900 — FAULTED
+                // ==================================================
+                
+            900:
+                #FaultLatched := TRUE;
+                
+                IF #InternalFaultCode = 0 THEN
+                    #InternalFaultCode := 900;
+                END_IF;
+                
+                
+                // ==================================================
+                // UNKNOWN STATE
+                // ==================================================
+                
+            ELSE
+                #FaultLatched := TRUE;
+                #InternalFaultCode := 901;
+                #CurrentState := 900;
+                
+        END_CASE;
+        
+    END_IF;
+    
+END_IF;
+
+
+// ----------------------------------------------------------
+// 6. IMMEDIATE SAFE RESPONSE TO A FAULT
+// ----------------------------------------------------------
+
+IF #FaultLatched THEN
+    
+    #CurrentState := 900;
+    
+    #MainConveyorCmd := FALSE;
+    
+    #PusherACmd := FALSE;
+    #PusherBCmd := FALSE;
+    
+    #BranchAConveyorCmd := FALSE;
+    #BranchBConveyorCmd := FALSE;
+    #RejectConveyorCmd := FALSE;
+    
+    #ARemoverCmd := FALSE;
+    #BRemoverCmd := FALSE;
+    #RejectRemoverCmd := FALSE;
+    
+    #CanAcceptProduct := FALSE;
+    #Busy := FALSE;
+    #RouteComplete := FALSE;
+    
+    #RouteTimerEnable := FALSE;
+    #PusherTimerEnable := FALSE;
+    #OutfeedTimerEnable := FALSE;
+    
+    
+    // Mark the active tracking record as faulted
+    IF (#CurrentIndex >= 1) AND
+        (#CurrentIndex <= 20) THEN
+        
+        IF "DB_ProductTracking".Products[
+            #CurrentIndex].Valid THEN
+            
+            "DB_ProductTracking".Products[
+            #CurrentIndex].TrackingFault := TRUE;
+            
+            // Status 9 = routing/tracking fault
+            "DB_ProductTracking".Products[
+            #CurrentIndex].Status := 9;
+            
+        END_IF;
+        
+    END_IF;
+    
+END_IF;
+
+
+// ----------------------------------------------------------
+// 7. IEC TIMER CALLS
+// ----------------------------------------------------------
+
+// The state comparison forces a timer reset for one scan
+// whenever the state machine advances to a different state.
+
+#RouteTimer.TON(
+                IN := #RouteTimerEnable AND
+                (#CurrentState = #StateAtScanStart),
+                PT := #RouteTimeout);
+
+#PusherTimer.TON(
+                 IN := #PusherTimerEnable AND
+                 (#CurrentState = #StateAtScanStart),
+                 PT := #PusherTimeout);
+
+#OutfeedTimer.TON(
+                  IN := #OutfeedTimerEnable AND
+                  (#CurrentState = #StateAtScanStart),
+                  PT := #OutfeedTimeout);
+
+
+// ----------------------------------------------------------
+// 8. PUBLISH INTERNAL STATUS
+// ----------------------------------------------------------
+
+#QueueCount := #InternalQueueCount;
+#QueueFull := (#InternalQueueCount >= 20);
+
+#Faulted := #FaultLatched;
+#FaultCode := #InternalFaultCode;
+
+#State := #CurrentState;
+#ActiveIndex := #CurrentIndex;
+#ActiveDestination := #CurrentDestination;
+

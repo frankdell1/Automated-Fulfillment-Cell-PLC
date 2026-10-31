@@ -1,0 +1,166 @@
+// ------------------------------------------------------------
+// FB_EmitterController
+// Automatic single-product emission with sorter handshake,
+// spacing, and arrival monitoring
+// ------------------------------------------------------------
+
+// Safe defaults every scan
+#EmitCmd := FALSE;
+#Ready := FALSE;
+#WaitingForProduct := FALSE;
+
+#PulseTimerEnable := FALSE;
+#ArrivalTimerEnable := FALSE;
+#SpacingTimerEnable := FALSE;
+
+
+// Reset has priority
+IF #ResetPB THEN
+    #Faulted := FALSE;
+    #FaultCode := 0;
+
+    // If a box already occupies induction, wait for it to leave
+    IF #InductionPresent THEN
+        #State := 40;
+    ELSE
+        #State := 10;
+    END_IF;
+
+ELSE
+
+    CASE #State OF
+
+        // Initialize
+        0:
+            #Faulted := FALSE;
+            #FaultCode := 0;
+            #State := 10;
+
+
+        // Wait until emission is permitted
+        10:
+            #Ready :=
+                #Enable
+                AND #AutoEnable
+                AND #InductionConveyorRunning
+                AND #TrackingAvailable
+                AND NOT #InductionPresent
+                AND NOT #Faulted;
+
+            IF #Ready THEN
+                #State := 20;
+            END_IF;
+
+
+        // Pulse the Factory I/O emitter
+        20:
+            IF NOT #Enable
+                OR NOT #AutoEnable
+                OR NOT #InductionConveyorRunning THEN
+
+                // The pulse may already have begun, so never pulse it again
+                #State := 30;
+
+            ELSE
+                #EmitCmd := TRUE;
+                #PulseTimerEnable := TRUE;
+
+                // Stop early if the product reaches the sensor
+                IF #InductionPresent THEN
+                    #EmitCmd := FALSE;
+                    #State := 40;
+
+                ELSIF #PulseTimer.Q THEN
+                    #EmitCmd := FALSE;
+                    #State := 30;
+                END_IF;
+            END_IF;
+
+
+        // Wait for the emitted product to reach Induction PE
+        30:
+            #WaitingForProduct := TRUE;
+
+            IF #InductionPresent THEN
+                #WaitingForProduct := FALSE;
+                #State := 40;
+
+            ELSE
+                // Count only while the induction conveyor is moving
+                #ArrivalTimerEnable :=
+                    #Enable AND #InductionConveyorRunning;
+
+                IF #ArrivalTimer.Q THEN
+                    #Faulted := TRUE;
+                    #FaultCode := 301;   // Emitted product not detected
+                    #WaitingForProduct := FALSE;
+                    #State := 900;
+                END_IF;
+            END_IF;
+
+
+        // Product detected - wait until it leaves induction
+        40:
+            IF NOT #InductionPresent THEN
+                #State := 45;
+            END_IF;
+
+
+        // Wait for the sorter to acknowledge/reserve this product
+        // TrackingAvailable must go FALSE after the product is queued
+        45:
+            IF NOT #TrackingAvailable THEN
+                #State := 46;
+            END_IF;
+
+
+        // Wait until the current product has been completely routed
+        // TrackingAvailable returns TRUE when the sorter is ready again
+        46:
+            IF #TrackingAvailable THEN
+                #State := 50;
+            END_IF;
+
+
+        // Minimum spacing before permitting another product
+        50:
+            IF #Enable THEN
+                #SpacingTimerEnable := TRUE;
+
+                IF #SpacingTimer.Q THEN
+                    #State := 10;
+                END_IF;
+            END_IF;
+
+
+        // Faulted
+        900:
+            #Faulted := TRUE;
+
+
+        // Invalid state protection
+        ELSE
+            #Faulted := TRUE;
+            #FaultCode := 399;
+            #State := 900;
+
+    END_CASE;
+
+END_IF;
+
+
+// IEC timer calls - must execute every PLC scan
+#PulseTimer.TON(
+    IN := #PulseTimerEnable,
+    PT := #PulseTime
+);
+
+#ArrivalTimer.TON(
+    IN := #ArrivalTimerEnable,
+    PT := #ArrivalTimeout
+);
+
+#SpacingTimer.TON(
+    IN := #SpacingTimerEnable,
+    PT := #SpacingTime
+);
